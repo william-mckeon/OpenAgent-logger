@@ -1,22 +1,21 @@
-```markdown
 # openagent-logger
 
 > **Capture layer for the OpenAgent system.** Receives signed events from `openagent-api` and stores them append-only in monthly-partitioned PostgreSQL tables.
 
 | | |
 |---|---|
-| **Version** | 1.0.0 |
+| **Version** | 0.1.0 |
 | **Port** | 8003 |
 | **Base image** | python:3.11-slim |
 | **Database** | PostgreSQL 13+ |
 | **Schema** | `openagent_logger` |
-| **Status** | active |
+| **Status** | working — pre-production |
 
 ---
 
 ## Overview
 
-`openagent-logger` is the capture layer of the OpenAgent system. It owns the **wire endpoint** that `openagent-api` (and future emitters) call to record three classes of event:
+`openagent-logger` is the capture layer of the OpenAgent system. It owns the **wire endpoint** that `openagent-api` calls to record three classes of event:
 
 - **ops_events** — operational telemetry (request_received, auth_failure, upstream_error, stream_complete, etc.). Short retention (default 90 days).
 - **conversation_captures** — full `/chat` content (input, output, token counts, model used, latency). Medium retention (default 180 days). Captures arrive from any model configured in the BYOC infrastructure layer, distinguished by the `model_used` column.
@@ -31,6 +30,8 @@ What `openagent-logger` **deliberately does not do**:
 - No rate limiting → defer to a reverse proxy.
 
 This separation keeps the capture path narrow, fast, and easy to reason about: validate the envelope, verify the HMAC, write the row, return.
+
+> **A note on the event envelope.** Every event carries an optional, nullable `session_id` and `user_id`. They are caller-supplied correlation fields — the logger accepts them, stores them, and never validates them. In the reference stack they arrive `null`; they exist so a caller that *does* track sessions or users can correlate events without a schema change. The logger has no opinion about either field beyond storing it.
 
 ---
 
@@ -60,17 +61,15 @@ This separation keeps the capture path narrow, fast, and easy to reason about: v
                                               ▼
                                     ┌───────────────────┐
                                     │ PostgreSQL        │
-                                    │ (shared instance) │
                                     │                   │
                                     │ openagent_logger.*│ ◀── owned here
                                     └───────────────────┘
-
 ```
 
 **Why this matters for openagent-logger.** Because it's parallel, not downstream of openagent-infra, openagent-logger:
 
 * Never sees the model response stream directly. `openagent-api` assembles the full response from the BYOC provider's SSE chunks, then submits the finished pair as a single `conversation_capture`.
-* Can be down without affecting `/chat` latency. `openagent-api` emits events fire-and-forget; events submitted while `openagent-logger` is down are **lost** until an outbox lands in `openagent-api`.
+* Can be down without affecting `/chat` latency. `openagent-api` emits events fire-and-forget; events submitted while `openagent-logger` is down are **lost** (there is no emitter-side outbox — see Known limitations).
 * Sees traffic equally from any configured model — whichever compute worker handled the `/chat` request, `openagent-api` emits a capture with `model_used` set accordingly. The schema is model-agnostic; downstream filtering happens at query time.
 
 ---
@@ -108,8 +107,8 @@ body = {
     "request_id": request_id,
     "source_service": "test-client",
     "client_timestamp": ts,
-    "session_id": None,
-    "user_id": None,
+    "session_id": None,   # optional, nullable, caller-supplied; not validated
+    "user_id": None,      # optional, nullable, caller-supplied; not validated
     "hmac_signature": sig,
     "payload": payload,
 }
@@ -121,7 +120,6 @@ r = httpx.post(
 )
 print(r.status_code, r.json())
 PY
-
 ```
 
 A successful call returns `201 Created` with the assigned `event_id`.
@@ -153,7 +151,6 @@ Every inbound request must carry the header:
 
 ```text
 X-API-Key: <value of LOGGER_API_KEY>
-
 ```
 
 Validated at the door using `hmac.compare_digest` (constant-time, no timing-attack leakage). Missing or wrong key → HTTP 401.
@@ -166,14 +163,13 @@ Every event body must carry an `hmac_signature` field. The signature is HMAC-SHA
 
 ```text
 {request_id}|{client_timestamp_iso}|{event_type}|{sha256(canonical_payload_json)}
-
 ```
 
 where `canonical_payload_json` is the event's `payload` dict serialised with `json.dumps(sort_keys=True, separators=(",", ":"), default=str)`.
 
 The receiver re-derives the canonical string from the parsed body and compares (constant-time) against `hmac_signature`. Mismatch → HTTP 401.
 
-This signature is **stored on the row** in the `hmac_signature` column. Downstream consumers and any future auditor can re-verify event integrity without trusting the original transport — they only need `LOGGER_HMAC_SECRET`.
+This signature is **stored on the row** in the `hmac_signature` column. A downstream consumer or auditor can re-verify event integrity without trusting the original transport — they only need `LOGGER_HMAC_SECRET`.
 
 ### Why two secrets instead of one
 
@@ -192,7 +188,7 @@ The emitter and receiver **must** compute the same canonical string for the same
 3. The canonical string is built from `{request_id}|{iso_timestamp}|{event_type}|{payload_hash}`.
 4. HMAC-SHA256 over the canonical string, using `LOGGER_HMAC_SECRET.encode("utf-8")` as the key.
 
-Both `src/security.py` (here) and `logger_client.py` in `openagent-api` implement this. They must stay in lockstep.
+Both `src/security.py` (here) and `src/client/logger.py` in `openagent-api` implement this. They must stay in lockstep.
 
 ---
 
@@ -227,7 +223,6 @@ Generate strong values with:
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(48))"
-
 ```
 
 ### Database (src/models.py)
@@ -265,13 +260,11 @@ This network connects `openagent-logger` to the shared Postgres. It only needs t
 ```powershell
 # Windows / PowerShell
 .\scripts\setup-network.ps1
-
 ```
 
 ```bash
 # Linux / macOS
 ./scripts/setup-network.sh
-
 ```
 
 **2. Start the shared Postgres on that network.** The `init.sql` from this repo is mounted into the container's init directory so the schema, tables, partitions, **and the fully-provisioned `openagent_logger` role** are created automatically on first boot.
@@ -290,7 +283,6 @@ docker run -d --name openagent-shared-db \
     -v "$(pwd)/database/init.sql:/docker-entrypoint-initdb.d/openagent-logger-init.sql:ro" \
     -p 5432:5432 \
     postgres:16
-
 ```
 
 ### Per-clone setup
@@ -309,7 +301,6 @@ docker compose logs -f openagent-logger
 # Quick smoke test
 LOGGER_API_KEY="$(grep ^LOGGER_API_KEY .env | cut -d= -f2)"
 curl -fsS -H "X-API-Key: ${LOGGER_API_KEY}" http://localhost:8003/health
-
 ```
 
 ### Local-only (no Docker) for tight iteration
@@ -325,7 +316,6 @@ export LOGGER_DB_PASSWORD="<openagent_logger role pwd>"
 export LOGGER_DB_HOST=localhost
 
 python -m src.api
-
 ```
 
 ### Resetting state during dev
@@ -336,7 +326,6 @@ docker exec -i openagent-shared-db psql -U postgres -d openagent_shared \
     -c "DROP SCHEMA openagent_logger CASCADE;"
 docker exec -i openagent-shared-db psql -U postgres -d openagent_shared \
     -f /docker-entrypoint-initdb.d/openagent-logger-init.sql
-
 ```
 
 ---
@@ -352,7 +341,6 @@ For the role-password handoff on Render, set `PGOPTIONS` on the admin/bootstrap 
 ```bash
 PGOPTIONS="-c logger.db_password=${LOGGER_DB_PASSWORD}" \
     psql "$DATABASE_URL" -f database/init.sql
-
 ```
 
 A single Render web service runs one container instance. Because `openagent-logger` uses an **in-process APScheduler** for retention, do not scale to multiple instances without first solving the multi-fire problem (see Known limitations).
@@ -367,16 +355,16 @@ The same `docker-compose.yml` works. Make sure `openagent-network` exists and th
 
 ### Why HTTP + HMAC, not direct DB writes?
 
-Other services might use a direct-DB pattern via SQLAlchemy. `openagent-logger` is the opposite case. Writes are append-only, never read on the hot path, and emitter and capture-layer are often on different hosts (gateway on a web tier, logger on a worker tier). HTTP+HMAC:
+A service that reads from the same schema it writes to, on a hot path, is better off talking to the database directly — the extra HTTP hop is just latency. `openagent-logger` is the opposite case. Writes are append-only, never read on the hot path, and emitter and capture-layer are often on different hosts (gateway on a web tier, logger on a worker tier). HTTP+HMAC:
 
 * Keeps the wire contract auditable independently of the DB schema.
-* Lets us deploy `openagent-logger` on a different host, in a different network, behind a different firewall.
-* Lets us scale capture independently of `openagent-api`.
-* Stores the integrity signature on the row, so downstream consumers can verify long after the original transport call is forgotten.
+* Lets me deploy `openagent-logger` on a different host, in a different network, behind a different firewall.
+* Lets me scale capture independently of `openagent-api`.
+* Stores the integrity signature on the row, so a downstream consumer can verify long after the original transport call is forgotten.
 
 ### Why parallel to openagent-infra, not in series?
 
-`openagent-api` could in principle proxy the conversation through `openagent-logger` on its way back to the frontend — making `openagent-logger` an inline observer. We chose parallel fan-out instead because:
+`openagent-api` could in principle proxy the conversation through `openagent-logger` on its way back to the frontend — making `openagent-logger` an inline observer. I chose parallel fan-out instead because:
 
 * **Latency.** A series topology adds `openagent-logger`'s full INSERT to every `/chat` response. Parallel topology pushes that work off the hot path entirely.
 * **Failure isolation.** When `openagent-logger` is down, `/chat` should keep working. In a series topology a logger outage breaks user-facing chat. In parallel it just drops capture events.
@@ -389,7 +377,7 @@ Other services might use a direct-DB pattern via SQLAlchemy. `openagent-logger` 
 * Survives DB upgrades and reprovisioning without manual cron re-setup.
 * Is unit-testable with the same Python tooling as the rest of the service.
 * Logs to the same stream as everything else (cross-service tailing).
-* Lets us change retention behaviour without a DB migration.
+* Lets me change retention behaviour without a DB migration.
 
 ### Why three tables, not one polymorphic table?
 
@@ -407,12 +395,9 @@ Daily partitions would create hundreds of partitions per table per year, which a
 
 `conversation_captures.model_used` is `VARCHAR(255)`, not an enum. The schema doesn't hard-code any specific provider or model string: when the compute layer changes, the column accepts the new identifier without a migration. Downstream consumers filter by `model_used` at query time.
 
-### Why schema-separated?
+### Why schema-scoped, not its own database?
 
-One Postgres instance is cheaper to run than many and shares its backup infrastructure. Schema separation gives loose coupling without the operational cost:
-
-* Different DB users (`openagent_logger`, etc.) with grants scoped to their own schemas.
-* Either service can be moved to a dedicated Postgres later without changing code; only the connection URL changes.
+The logger lives in its own schema (`openagent_logger`) inside the shared Postgres instance, with a role whose grants are scoped to that schema. That keeps the door open: another service can later share the same instance under its own schema and role without colliding with this one, and the logger can be lifted out to a dedicated Postgres at any time by changing only the connection URL — no code change. One instance is cheaper to run and back up than several, and schema-scoping buys the loose coupling without the operational cost.
 
 ### Why `DROP PARTITION`, not `DELETE`?
 
@@ -428,11 +413,11 @@ Retention by `DROP TABLE <expired_partition>` is:
 * Returns disk to the filesystem immediately.
 * Leaves no dead tuples to clean up.
 
-The trade-off is partition granularity — you can only retain in whole months, not days. For our use case that is the correct trade.
+The trade-off is partition granularity — you can only retain in whole months, not days. For this use case that is the correct trade.
 
 ### Why pass the role password via PGOPTIONS, not a separate ALTER ROLE step?
 
-Passing the password as a custom GUC via `PGOPTIONS` lets `init.sql` read it during initial setup and create the role with the correct password in one transaction. This enables a service that connects on first boot rather than requiring a second manual debugging pass.
+Passing the password as a custom GUC via `PGOPTIONS` lets `init.sql` read it during initial setup and create the role with the correct password in one transaction. This means the service connects on first boot rather than requiring a second manual debugging pass.
 
 ---
 
@@ -454,9 +439,9 @@ The retention scheduler runs in-process via APScheduler. If you scale `openagent
 
 ### HMAC canonical-string contract duplication
 
-Both `src/security.py` and `logger_client.py` in `openagent-api` must compute the canonical string identically. There is no shared library yet.
+Both `src/security.py` and `src/client/logger.py` in `openagent-api` must compute the canonical string identically. There is no shared library yet.
 
-**Mitigation**: extract to a shared package once both sides have shipped and the contract is stable.
+**Mitigation**: extract to a shared package once both sides have stabilised.
 
 ### Authenticated `/health` and `/stats`
 
@@ -466,9 +451,9 @@ These endpoints require `X-API-Key`. A naive load-balancer or platform healthche
 
 ### No transactional outbox on the emitter side
 
-`logger_client.py` in `openagent-api` is fire-and-forget. If `openagent-logger` is down when an event is emitted, the event is **lost** — there is no retry queue, no on-disk buffer.
+The emitter (`openagent-api`) is fire-and-forget. If `openagent-logger` is down when an event is emitted, the event is **lost** — there is no retry queue, no on-disk buffer.
 
-**Mitigation**: accepted for now. `openagent-logger` is highly available in practice; permanent loss of an `ops_event` is operationally tolerable. For `conversation_captures` and `audit_events` an outbox would be warranted.
+**Mitigation**: accepted for now. `openagent-logger` is highly available in practice; permanent loss of an `ops_event` is operationally tolerable. For `conversation_captures` and `audit_events`, an outbox would be warranted.
 
 ---
 
@@ -498,7 +483,6 @@ openagent-logger/
 ├── .dockerignore            Build-context exclusions (.env never in image)
 ├── .gitignore               Standard Python + .env never in git
 └── README.md                This file
-
 ```
 
 ---
@@ -511,9 +495,8 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-```
+```text
 http://www.apache.org/licenses/LICENSE-2.0
-
 ```
 
 Unless required by applicable law or agreed to in writing, software
@@ -522,6 +505,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-```
+---
 
-```
+## Maintainer
+
+**William McKeon** ([github.com/william-mckeon](https://github.com/william-mckeon))
