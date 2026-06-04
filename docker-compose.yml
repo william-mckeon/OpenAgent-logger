@@ -2,72 +2,131 @@
 # openagent-logger - local development compose
 # ============================================================================
 #
-# Single-service compose. openagent-logger connects to a shared Postgres
-# instance that lives OUTSIDE this file. Schema separation keeps the logger
-# isolated within the shared database (openagent_logger.*), leaving room for
-# another service to share the same instance under its own schema later.
+# Two services: the shared Postgres instance (openagent-shared-db) and the
+# logger itself (openagent-logger). A single `docker compose up -d --build`
+# brings up both, so the logger's LOGGER_DB_HOST (openagent-shared-db)
+# resolves over the shared network with no separate `docker run` step.
+#
+# Schema separation keeps the logger isolated within the shared database
+# (openagent_logger.* inside openagent_shared), leaving room for another
+# service to share the same instance under its own schema later.
 #
 # Prerequisites
 # -------------
-# 1. The shared Postgres container is running and attached to a Docker
-#    network named "openagent-network". If you don't yet have one, create
-#    the network and start Postgres on it before bringing this up.
-#
-#    The openagent_logger role's password is supplied at init time via the
-#    PGOPTIONS env var on the Postgres container, sourced from
-#    LOGGER_DB_PASSWORD in .env. database/init.sql reads it and creates
-#    the role with the right password on first boot - no separate
-#    ALTER ROLE step required.
+# 1. The external network must exist (every OpenAgent service attaches to it):
 #
 #       docker network create openagent-network
-#
-#       # Pull the role password from .env first:
-#       LOGGER_DB_PASSWORD="$(grep ^LOGGER_DB_PASSWORD .env | cut -d= -f2-)"
-#
-#       docker run -d --name openagent-shared-db \
-#           --network openagent-network \
-#           -e POSTGRES_PASSWORD=<admin secret> \
-#           -e POSTGRES_DB=openagent_shared \
-#           -e PGOPTIONS="-c logger.db_password=${LOGGER_DB_PASSWORD}" \
-#           -v "$(pwd)/database/init.sql:/docker-entrypoint-initdb.d/openagent-logger-init.sql:ro" \
-#           -p 5432:5432 \
-#           postgres:16
-#
-#    Windows / PowerShell equivalent (see README §"Prerequisites" for
-#    the full version with backticks for line continuation).
 #
 # 2. Copy the env template and fill in the secrets:
 #
 #       cp .env.example .env
-#       # then edit .env
+#       # then edit .env  (LOGGER_DB_PASSWORD must be set)
+#
+#    On Windows, save .env with LF line endings. A trailing CR would ride
+#    along into ${LOGGER_DB_PASSWORD} below and into the logger's own copy
+#    of the value, and the two would no longer match -> connection auth
+#    failures that look like a wrong password.
+#
+# Password handoff (no separate ALTER ROLE step)
+# ----------------------------------------------
+# The openagent_logger role's password is handed to Postgres at init time via
+# the custom GUC `logger.db_password`, set through PGOPTIONS on the db service
+# below and sourced from LOGGER_DB_PASSWORD in .env. database/init.sql reads
+# current_setting('logger.db_password') and creates/updates the role on first
+# boot. The same LOGGER_DB_PASSWORD value in .env is what the logger then
+# connects with, so the two always agree.
 #
 # Usage
 # -----
-#   docker compose up --build                  # build and start
-#   docker compose logs -f openagent-logger    # tail logs
-#   docker compose down                        # stop and remove
+#   docker compose up -d --build               # build + start db and logger
+#   docker compose logs -f openagent-logger    # tail the logger
+#   docker compose logs -f openagent-shared-db # tail Postgres
+#   docker compose down                        # stop and remove (keeps data)
+#   docker compose down -v                     # also wipe the DB volume
+#
+# init.sql runs only on the FIRST boot of an empty data volume. If you need
+# it to run again (e.g. after changing it), wipe the volume first with
+# `docker compose down -v`, then bring the stack back up.
 #
 # When editing .env
 # -----------------
-# `docker compose restart` does NOT re-read env_file. After changing
-# .env, recreate the container so it picks up the new values:
+# `docker compose restart` does NOT re-read env_file. After changing .env,
+# recreate the container so it picks up the new values:
 #
 #   docker compose up -d --force-recreate openagent-logger
 #
 # Render note
 # -----------
-# This file is for local dev only. On Render, the service is deployed
-# via the same Dockerfile referenced below; env vars are configured
-# in the Render dashboard. This compose file is not used.
+# This file is for local dev only. On Render, the logger is deployed via the
+# same Dockerfile referenced below against a managed Postgres; env vars are
+# configured in the Render dashboard and this compose file is not used.
 # ============================================================================
 
 services:
+  # --------------------------------------------------------------------------
+  # Shared Postgres instance. Owned by openagent-logger; other OpenAgent
+  # services may later share it under their own schema/role.
+  # --------------------------------------------------------------------------
+  openagent-shared-db:
+    image: postgres:16
+    container_name: openagent-shared-db
+
+    environment:
+      # The entrypoint creates this database and runs the init scripts
+      # connected to it. init.sql adds the openagent_logger schema/role inside.
+      POSTGRES_DB: openagent_shared
+
+      # Superuser password (the `postgres` role). Local-dev default; override
+      # by setting POSTGRES_ADMIN_PASSWORD in .env. This is NOT the logger
+      # role password - that comes from LOGGER_DB_PASSWORD via PGOPTIONS below.
+      POSTGRES_PASSWORD: "${POSTGRES_ADMIN_PASSWORD:-openagent_admin}"
+
+      # Hands LOGGER_DB_PASSWORD to init.sql as the `logger.db_password` GUC,
+      # which it reads to create the openagent_logger role. Interpolated from
+      # .env at compose parse time.
+      PGOPTIONS: "-c logger.db_password=${LOGGER_DB_PASSWORD}"
+
+    ports:
+      # Host mapping is only for local tools (psql / pgAdmin). The logger
+      # reaches the DB by container name over openagent-network, not via this
+      # published port - so if 5432 is already taken on your host, you can
+      # remove this line without affecting the logger.
+      - "5432:5432"
+
+    volumes:
+      # Persist data across restarts.
+      - openagent-pgdata:/var/lib/postgresql/data
+      # Bootstrap script, run once on first init of an empty data volume.
+      - ./database/init.sql:/docker-entrypoint-initdb.d/openagent-logger-init.sql:ro
+
+    healthcheck:
+      # Gate the logger's start on Postgres actually accepting connections.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d openagent_shared"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+    restart: unless-stopped
+
+    networks:
+      - openagent-network
+
+  # --------------------------------------------------------------------------
+  # The logger service.
+  # --------------------------------------------------------------------------
   openagent-logger:
     build:
       context: .
       dockerfile: docker/logger/Dockerfile
     image: openagent-logger:latest
     container_name: openagent-logger
+
+    # Wait for Postgres to be healthy before starting, so the first DB probe
+    # succeeds instead of racing the database.
+    depends_on:
+      openagent-shared-db:
+        condition: service_healthy
 
     # Publish the internal port to the host so curl / postman / a
     # local openagent-api can reach the service at http://localhost:8003.
@@ -102,8 +161,13 @@ services:
     networks:
       - openagent-network
 
+volumes:
+  # Postgres data directory, persisted across `docker compose down`
+  # (removed by `docker compose down -v`).
+  openagent-pgdata:
+
 networks:
-  # External network where the shared Postgres instance lives.
+  # External network shared by every OpenAgent service.
   # Must be created before running `docker compose up`:
   #     docker network create openagent-network
   openagent-network:
