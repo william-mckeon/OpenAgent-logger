@@ -1,0 +1,41 @@
+# =============================================================================
+# openagent-logger - Python dependencies
+# =============================================================================
+#
+# Compatible-release pins (>=A,<B) allow patch and approved minor updates
+# within a known-safe band. To upgrade a package:
+#     pip install --upgrade <package>
+# then verify the service still boots, /health stays green, and any tests
+# pass before committing the new lower bound here.
+#
+# Notes on choices:
+#   - `pydantic` is pinned explicitly because src/schemas.py uses v2
+#     features (ConfigDict, field_validator, Annotated discriminated
+#     unions). FastAPI's transitive pin should already give us v2, but
+#     pinning here defends against accidental v1 regressions.
+#   - `uvicorn` is the plain package (no [standard] extras). Add
+#     uvicorn[standard] only if you need uvloop / httptools in
+#     performance-critical deployments.
+#   - `httpx` is included for tests and any future outbound calls; the
+#     ingest path itself does not make outbound HTTP requests.
+# =============================================================================
+
+# --- Web framework + ASGI server -------------------------------------------
+fastapi>=0.115.0,<0.120.0
+uvicorn>=0.30.0,<0.35.0
+
+# --- HTTP client (tests + future outbound calls) ---------------------------
+httpx>=0.27.0,<0.30.0
+
+# --- Data validation (Pydantic v2 features used in src/schemas.py) ---------
+pydantic>=2.6.0,<3.0.0
+
+# --- Database --------------------------------------------------------------
+sqlalchemy>=2.0.30,<2.1.0
+psycopg2-binary>=2.9.9,<3.0.0
+
+# --- Scheduler (retention + partition rollover, src/scheduler.py) ----------
+apscheduler>=3.10.0,<4.0.0
+
+# --- Configuration ---------------------------------------------------------
+python-dotenv>=1.0.0,<2.0.0

@@ -1,0 +1,104 @@
+# =============================================================================
+# openagent-logger - Git ignore rules
+# =============================================================================
+# CRITICAL: .env contains secrets. It must NEVER be committed.
+# =============================================================================
+
+
+# --- Secrets ---------------------------------------------------------------
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets/
+
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+
+# --- Distribution / packaging ----------------------------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+*.whl
+
+
+# --- Virtual environments --------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+
+# --- Testing / coverage ----------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+
+# --- Type checkers ---------------------------------------------------------
+.mypy_cache/
+.pyright/
+.pytype/
+.pyre/
+
+
+# --- Linters / formatters --------------------------------------------------
+.ruff_cache/
+.black_cache/
+
+
+# --- IDE / editor ----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.spyderproject
+.spyproject
+
+
+# --- OS noise --------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+
+# --- Runtime artifacts -----------------------------------------------------
+*.log
+logs/
+
+
+# --- Local databases / data ------------------------------------------------
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+
+# --- Docker (build artifacts only; Dockerfile and compose are tracked) -----
+.docker/
+*.tar
+
+
+# --- Jupyter (in case anyone scratches in a notebook) ----------------------
+.ipynb_checkpoints/
+*.ipynb

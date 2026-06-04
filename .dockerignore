@@ -1,0 +1,88 @@
+# =============================================================================
+# openagent-logger - Docker build-context exclusions
+# =============================================================================
+#
+# Everything listed here is excluded from the `docker build` context. A
+# smaller context means faster builds and smaller, leaner images.
+#
+# CRITICAL: .env must be excluded. Never bake secrets into image layers.
+# =============================================================================
+
+
+# --- Version control --------------------------------------------------------
+.git
+.gitignore
+.gitattributes
+.github
+
+
+# --- Secrets - NEVER bake these into image layers ---------------------------
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets/
+
+
+# --- Python build / cache artifacts -----------------------------------------
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+build
+dist
+*.egg-info
+.eggs
+
+
+# --- Test / coverage / type-checker caches ---------------------------------
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.tox
+.nox
+.coverage
+.coverage.*
+htmlcov
+.hypothesis
+.pytype
+
+
+# --- Virtual environments ---------------------------------------------------
+.venv
+venv
+env
+ENV
+
+
+# --- IDE / editor -----------------------------------------------------------
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+
+# --- OS noise ---------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+
+# --- Runtime artifacts ------------------------------------------------------
+*.log
+logs
+
+
+# --- Documentation (keep image lean; README intentionally kept) -------------
+docs
+
+
+# --- Compose / orchestration (not part of the image) -----------------------
+docker-compose.yml
+docker-compose.*.yml
+
+
+# --- This file itself -------------------------------------------------------
+.dockerignore
