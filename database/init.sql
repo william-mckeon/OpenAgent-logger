@@ -530,6 +530,10 @@ SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
     v_is_partition BOOLEAN;
+    v_year         INT;
+    v_month        INT;
+    v_end          DATE;
+    v_min_age_days INT;
 BEGIN
     -- Name must match a managed parent's partition naming convention.
     IF p_partition !~ '^(ops_events|conversation_captures|audit_events)_y[0-9]{4}m[0-9]{2}$' THEN
@@ -548,6 +552,29 @@ BEGIN
 
     IF NOT v_is_partition THEN
         RAISE EXCEPTION 'drop_partition: % is not an attached partition', p_partition;
+    END IF;
+
+    -- Server-side retention floor: the function — not the caller — decides the
+    -- minimum age before a partition may be dropped. This is the backstop that
+    -- makes the append-only guarantee hold even if the app token is
+    -- compromised: a direct drop_partition('audit_events_y2026m06') for live or
+    -- within-window data is REFUSED here. The app scheduler's own cutoff still
+    -- decides WHICH expired partitions to drop; this only sets the hard minimum.
+    v_year  := substring(p_partition from '_y([0-9]{4})m[0-9]{2}$')::int;
+    v_month := substring(p_partition from 'm([0-9]{2})$')::int;
+    v_end   := (make_date(v_year, v_month, 1) + INTERVAL '1 month')::date;
+
+    v_min_age_days := CASE
+        WHEN p_partition LIKE 'audit_events_%'          THEN 2555  -- ~7 years
+        WHEN p_partition LIKE 'conversation_captures_%' THEN 180
+        ELSE 90                                                    -- ops_events
+    END;
+
+    IF v_end > (CURRENT_DATE - make_interval(days => v_min_age_days)) THEN
+        RAISE EXCEPTION
+            'drop_partition: % is within its minimum retention floor '
+            '(range ends %, floor % days) — refusing',
+            p_partition, v_end, v_min_age_days;
     END IF;
 
     EXECUTE FORMAT('DROP TABLE IF EXISTS openagent_logger.%I', p_partition);
