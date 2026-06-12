@@ -283,6 +283,9 @@ async def create_event(
         request_id=str(event.request_id),
         client_timestamp=event.client_timestamp,
         event_type=event.event_type.value,
+        source_service=event.source_service,
+        session_id=event.session_id,
+        user_id=event.user_id,
         payload=payload_dict,
         signature=event.hmac_signature,
     )

@@ -166,22 +166,63 @@ def canonical_payload_json(payload: Dict[str, Any]) -> str:
     )
 
 
+def canonical_timestamp(dt: datetime) -> str:
+    """
+    Render a datetime as the canonical client_timestamp string.
+
+    Normalised to UTC with fixed microsecond precision and a '+00:00'
+    offset, e.g. '2026-05-14T18:24:01.342000+00:00'. The emitter signs over
+    this exact form, so we re-canonicalise the parsed timestamp before
+    verifying rather than relying on the brittle assumption that
+    `datetime.fromisoformat(s).isoformat() == s` for every emitter (a 'Z'
+    suffix, non-UTC offset, or sub-second-zero would otherwise fail with a
+    misleading 'Invalid HMAC signature').
+
+    MUST match openagent-api/src/client/logger.py:_canonical_timestamp
+    byte-for-byte.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _fmt_envelope_field(value: Optional[Any]) -> str:
+    """
+    Render an optional signed attribution field for the canonical string.
+
+    None renders as the empty string. MUST match the emitter's
+    _fmt_envelope_field byte-for-byte.
+    """
+    return "" if value is None else str(value)
+
+
 def compute_signature(
     request_id: str,
     client_timestamp: str,
     event_type: str,
+    source_service: str,
+    session_id: Optional[str],
+    user_id: Optional[Any],
     payload: Dict[str, Any],
 ) -> str:
     """
     Compute the HMAC-SHA256 signature for an event.
 
     Canonical string:
-        {request_id}|{client_timestamp}|{event_type}|{sha256(payload_canonical)}
+        {request_id}|{client_timestamp}|{event_type}
+          |{source_service}|{session_id}|{user_id}|{sha256(payload_canonical)}
+
+    The attribution fields (source_service, session_id, user_id) are signed
+    so they cannot be rewritten in transit; they are persisted on the row and
+    feed the audit trail. None session_id/user_id render as the empty string.
 
     Args:
         request_id: Stringified UUID for the originating /chat call.
-        client_timestamp: ISO-format timestamp from the emitter.
+        client_timestamp: Canonical timestamp string (see canonical_timestamp).
         event_type: The event-type discriminator value (e.g., 'ops_event').
+        source_service: Emitter identifier (signed attribution field).
+        session_id: Caller session correlation, or None (signed).
+        user_id: Caller user id, or None (signed).
         payload: The event payload dict.
 
     Returns:
@@ -190,7 +231,17 @@ def compute_signature(
     payload_canonical = canonical_payload_json(payload)
     payload_hash = hashlib.sha256(payload_canonical.encode("utf-8")).hexdigest()
 
-    canonical_string = f"{request_id}|{client_timestamp}|{event_type}|{payload_hash}"
+    canonical_string = "|".join(
+        (
+            request_id,
+            client_timestamp,
+            event_type,
+            source_service,
+            _fmt_envelope_field(session_id),
+            _fmt_envelope_field(user_id),
+            payload_hash,
+        )
+    )
 
     return hmac.new(
         LOGGER_HMAC_SECRET.encode("utf-8"),
@@ -207,6 +258,9 @@ def verify_signature(
     request_id: str,
     client_timestamp: str,
     event_type: str,
+    source_service: str,
+    session_id: Optional[str],
+    user_id: Optional[Any],
     payload: Dict[str, Any],
     signature: str,
 ) -> Tuple[bool, str]:
@@ -215,8 +269,11 @@ def verify_signature(
 
     Args:
         request_id: The event's request_id (as string).
-        client_timestamp: The event's client_timestamp (as ISO string).
+        client_timestamp: The event's canonical client_timestamp string.
         event_type: The event-type discriminator.
+        source_service: Emitter identifier (signed attribution field).
+        session_id: Caller session correlation, or None (signed).
+        user_id: Caller user id, or None (signed).
         payload: The event payload dict (post-Pydantic model_dump).
         signature: The signature claimed by the emitter.
 
@@ -232,6 +289,9 @@ def verify_signature(
         request_id=request_id,
         client_timestamp=client_timestamp,
         event_type=event_type,
+        source_service=source_service,
+        session_id=session_id,
+        user_id=user_id,
         payload=payload,
     )
 
@@ -275,6 +335,9 @@ def verify_event(
     request_id: str,
     client_timestamp: datetime,
     event_type: str,
+    source_service: str,
+    session_id: Optional[str],
+    user_id: Optional[Any],
     payload: Dict[str, Any],
     signature: str,
 ) -> Tuple[bool, str]:
@@ -286,8 +349,11 @@ def verify_event(
 
     Args:
         request_id: The event's request_id.
-        client_timestamp: The event's client_timestamp.
+        client_timestamp: The event's client_timestamp (parsed datetime).
         event_type: The event-type discriminator.
+        source_service: Emitter identifier (signed attribution field).
+        session_id: Caller session correlation, or None (signed).
+        user_id: Caller user id, or None (signed).
         payload: The event payload dict.
         signature: The claimed signature.
 
@@ -299,11 +365,16 @@ def verify_event(
     if not ok:
         return False, error
 
-    iso_timestamp = client_timestamp.isoformat()
+    # Re-canonicalise the parsed timestamp to the exact form the emitter
+    # signed over, rather than trusting datetime.isoformat() to round-trip.
+    iso_timestamp = canonical_timestamp(client_timestamp)
     ok, error = verify_signature(
         request_id=request_id,
         client_timestamp=iso_timestamp,
         event_type=event_type,
+        source_service=source_service,
+        session_id=session_id,
+        user_id=user_id,
         payload=payload,
         signature=signature,
     )

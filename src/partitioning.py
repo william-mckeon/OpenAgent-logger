@@ -113,15 +113,20 @@ def create_partition_for_month(
     partition_name = partition_name_for_month(table_name, year, month)
     start_d, end_d = _month_range(year, month)
 
+    # Partition creation goes through the SECURITY DEFINER function so the app
+    # role does not need CREATE/ownership on the schema (see database/init.sql).
+    # The function re-validates the parent name and month bounds and returns
+    # the partition it ensured.
     sql = text(
-        f"CREATE TABLE IF NOT EXISTS {schema}.{partition_name} "
-        f"PARTITION OF {schema}.{table_name} "
-        f"FOR VALUES FROM (:start_d) TO (:end_d)"
+        "SELECT openagent_logger.create_month_partition(:parent, :start_d, :end_d)"
     )
 
     try:
         with engine.begin() as conn:
-            conn.execute(sql, {"start_d": start_d, "end_d": end_d})
+            conn.execute(
+                sql,
+                {"parent": table_name, "start_d": start_d, "end_d": end_d},
+            )
         logger.info(
             f"Partition ensured: {schema}.{partition_name} "
             f"[{start_d.isoformat()} -> {end_d.isoformat()})"
@@ -206,10 +211,13 @@ def drop_partitions_older_than(
             continue
 
         if end_date <= cutoff:
-            drop_sql = text(f"DROP TABLE {schema}.{partition_name}")
+            # DROP goes through the SECURITY DEFINER function: the app role is
+            # not an owner and cannot DROP directly. The function re-validates
+            # the name and that it is an attached partition before dropping.
+            drop_sql = text("SELECT openagent_logger.drop_partition(:partition)")
             try:
                 with engine.begin() as conn:
-                    conn.execute(drop_sql)
+                    conn.execute(drop_sql, {"partition": partition_name})
                 logger.info(
                     f"Dropped partition {schema}.{partition_name} "
                     f"(ended {end_date.isoformat()}, cutoff {cutoff.isoformat()})"

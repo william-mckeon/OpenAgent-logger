@@ -125,10 +125,41 @@ $$;
 
 
 -- -----------------------------------------------------------------------------
+-- Role: openagent_logger_admin  (privileged owner; NOLOGIN)
+-- -----------------------------------------------------------------------------
+-- Owns the schema, the partitioned tables, and the partition-management
+-- functions. It is NOLOGIN: nothing ever connects as this role, so its
+-- privileges are reachable only through the SECURITY DEFINER functions below.
+--
+-- This is the privilege split that makes the append-only claim TRUE: the
+-- app's login role (openagent_logger) is granted SELECT, INSERT and EXECUTE
+-- only. It does NOT own any object, so it cannot DROP, TRUNCATE, ALTER, or
+-- re-GRANT. Retention DROPs and calendar-boundary partition CREATEs happen
+-- exclusively through the two functions, which run with this owner's rights
+-- and validate their inputs. A compromised openagent_logger token therefore
+-- cannot remove or rewrite audit data en masse.
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'openagent_logger_admin'
+    ) THEN
+        CREATE ROLE openagent_logger_admin
+            WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT;
+        RAISE NOTICE 'Created role openagent_logger_admin (NOLOGIN owner).';
+    ELSE
+        RAISE NOTICE 'Role openagent_logger_admin already existed.';
+    END IF;
+END
+$$;
+
+
+-- -----------------------------------------------------------------------------
 -- Schema: openagent_logger
 -- -----------------------------------------------------------------------------
+-- Owned by the admin role so the app login role cannot DROP SCHEMA ... CASCADE.
 
-CREATE SCHEMA IF NOT EXISTS openagent_logger AUTHORIZATION openagent_logger;
+CREATE SCHEMA IF NOT EXISTS openagent_logger AUTHORIZATION openagent_logger_admin;
 
 COMMENT ON SCHEMA openagent_logger IS
     'Capture layer for the OpenAgent system: operational events, conversation '
@@ -406,15 +437,19 @@ $$;
 
 
 -- =============================================================================
--- Ownership: transfer everything in openagent_logger to the openagent_logger role
+-- Ownership: transfer every table in openagent_logger to openagent_logger_admin
 -- =============================================================================
 -- If init.sql was run by a superuser, the parent tables and the initial
--- partitions are owned by that superuser. We want openagent_logger to own
--- them so the daily scheduler can DROP expired partitions at runtime
--- (DROP TABLE requires being the owner).
+-- partitions are owned by that superuser. We transfer them to the NOLOGIN
+-- admin role so that:
+--   - the app login role (openagent_logger) is NOT an owner and therefore
+--     cannot DROP / TRUNCATE / ALTER any table, and
+--   - the SECURITY DEFINER partition functions (owned by admin) can still
+--     CREATE next month's partition and DROP expired ones at runtime.
 --
--- New partitions created at runtime by openagent-logger inherit ownership
--- naturally because the service connects as the openagent_logger role.
+-- Partitions created at runtime are created BY the admin-owned function
+-- (SECURITY DEFINER runs as admin), so they inherit admin ownership and the
+-- app role never gains drop rights on them.
 
 DO $$
 DECLARE
@@ -432,41 +467,132 @@ BEGIN
             'ALTER TABLE %I.%I OWNER TO %I',
             'openagent_logger',
             rec.relname,
-            'openagent_logger'
+            'openagent_logger_admin'
         );
         owned_count := owned_count + 1;
     END LOOP;
 
-    RAISE NOTICE 'Transferred ownership of % object(s) to openagent_logger', owned_count;
+    RAISE NOTICE 'Transferred ownership of % object(s) to openagent_logger_admin', owned_count;
 END
 $$;
 
 
 -- =============================================================================
--- Grants for the openagent_logger role
+-- Partition-management functions (SECURITY DEFINER, owned by admin)
 -- =============================================================================
--- Append-only by grant: SELECT and INSERT only. No UPDATE, no DELETE.
--- This enforces the append-only design at the database layer - even a
--- compromised service token can not silently rewrite or remove rows.
---
--- DROP TABLE on partitions is permitted because openagent_logger OWNS the
--- partition tables (set by the ownership block above). Ownership rights
--- and DML grants are separate concepts in PostgreSQL.
---
--- CREATE on the schema is required so the runtime scheduler can create
--- next-month partitions on demand.
+-- These are the ONLY way the runtime can create or drop partitions. They run
+-- with the admin owner's rights but are callable by the app login role via an
+-- explicit EXECUTE grant. Each validates that the target is one of the three
+-- managed parent tables and follows the <parent>_yYYYYmMM naming convention,
+-- so the app role cannot use them to touch anything else. search_path is
+-- pinned to defeat search_path-hijack attacks against SECURITY DEFINER code.
 
-GRANT USAGE  ON SCHEMA openagent_logger TO openagent_logger;
-GRANT CREATE ON SCHEMA openagent_logger TO openagent_logger;
+CREATE OR REPLACE FUNCTION openagent_logger.create_month_partition(
+    p_parent TEXT,
+    p_start  DATE,
+    p_end    DATE
+) RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_partition TEXT;
+BEGIN
+    IF p_parent NOT IN ('ops_events', 'conversation_captures', 'audit_events') THEN
+        RAISE EXCEPTION 'create_month_partition: unmanaged parent table %', p_parent;
+    END IF;
+    IF p_end <> (date_trunc('month', p_start::timestamp) + INTERVAL '1 month')::date
+       OR p_start <> date_trunc('month', p_start::timestamp)::date THEN
+        RAISE EXCEPTION 'create_month_partition: [%, %) is not a whole calendar month', p_start, p_end;
+    END IF;
+
+    v_partition := FORMAT('%s_y%sm%s',
+        p_parent,
+        to_char(p_start, 'YYYY'),
+        to_char(p_start, 'MM'));
+
+    EXECUTE FORMAT(
+        'CREATE TABLE IF NOT EXISTS openagent_logger.%I '
+        'PARTITION OF openagent_logger.%I FOR VALUES FROM (%L) TO (%L)',
+        v_partition, p_parent, p_start, p_end
+    );
+    RETURN v_partition;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION openagent_logger.drop_partition(
+    p_partition TEXT
+) RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_is_partition BOOLEAN;
+BEGIN
+    -- Name must match a managed parent's partition naming convention.
+    IF p_partition !~ '^(ops_events|conversation_captures|audit_events)_y[0-9]{4}m[0-9]{2}$' THEN
+        RAISE EXCEPTION 'drop_partition: % is not a managed partition name', p_partition;
+    END IF;
+
+    -- And it must actually BE a partition (a child via pg_inherits), never a
+    -- parent or an unrelated table that happens to match the pattern.
+    SELECT EXISTS (
+        SELECT 1
+        FROM pg_inherits i
+        JOIN pg_class c ON c.oid = i.inhrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'openagent_logger' AND c.relname = p_partition
+    ) INTO v_is_partition;
+
+    IF NOT v_is_partition THEN
+        RAISE EXCEPTION 'drop_partition: % is not an attached partition', p_partition;
+    END IF;
+
+    EXECUTE FORMAT('DROP TABLE IF EXISTS openagent_logger.%I', p_partition);
+    RETURN TRUE;
+END
+$$;
+
+ALTER FUNCTION openagent_logger.create_month_partition(TEXT, DATE, DATE)
+    OWNER TO openagent_logger_admin;
+ALTER FUNCTION openagent_logger.drop_partition(TEXT)
+    OWNER TO openagent_logger_admin;
+
+-- EXECUTE must be granted explicitly: default EXECUTE-to-PUBLIC is revoked so
+-- only the app login role can call these.
+REVOKE ALL ON FUNCTION openagent_logger.create_month_partition(TEXT, DATE, DATE) FROM PUBLIC;
+REVOKE ALL ON FUNCTION openagent_logger.drop_partition(TEXT) FROM PUBLIC;
+
+
+-- =============================================================================
+-- Grants for the openagent_logger (app login) role
+-- =============================================================================
+-- Append-only AND ownership-free: SELECT and INSERT on the data, plus EXECUTE
+-- on the two partition functions. No UPDATE, no DELETE, no CREATE on the
+-- schema, and — because the tables are owned by openagent_logger_admin, not
+-- this role — no DROP / TRUNCATE / ALTER. Retention and calendar-boundary
+-- partition management go exclusively through the SECURITY DEFINER functions.
+-- This is what makes "a compromised service token cannot silently rewrite or
+-- remove rows" actually hold, including against bulk removal via DROP.
+
+GRANT USAGE ON SCHEMA openagent_logger TO openagent_logger;
 
 GRANT SELECT, INSERT ON ALL TABLES    IN SCHEMA openagent_logger TO openagent_logger;
 GRANT USAGE          ON ALL SEQUENCES IN SCHEMA openagent_logger TO openagent_logger;
 
--- Future objects in the schema (partitions created by the scheduler,
--- additional tables added later) inherit the same grants automatically.
-ALTER DEFAULT PRIVILEGES IN SCHEMA openagent_logger
+GRANT EXECUTE ON FUNCTION openagent_logger.create_month_partition(TEXT, DATE, DATE)
+    TO openagent_logger;
+GRANT EXECUTE ON FUNCTION openagent_logger.drop_partition(TEXT)
+    TO openagent_logger;
+
+-- Future partitions are created by the admin-owned SECURITY DEFINER function
+-- (so they are owned by admin). Default privileges FOR ROLE openagent_logger_admin
+-- ensure the app role automatically gets SELECT/INSERT on each new partition.
+ALTER DEFAULT PRIVILEGES FOR ROLE openagent_logger_admin IN SCHEMA openagent_logger
     GRANT SELECT, INSERT ON TABLES TO openagent_logger;
-ALTER DEFAULT PRIVILEGES IN SCHEMA openagent_logger
+ALTER DEFAULT PRIVILEGES FOR ROLE openagent_logger_admin IN SCHEMA openagent_logger
     GRANT USAGE ON SEQUENCES TO openagent_logger;
 
 
