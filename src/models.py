@@ -24,6 +24,7 @@ import os
 import uuid
 from datetime import datetime
 from typing import Optional
+from urllib.parse import quote
 
 from sqlalchemy import (
     DateTime,
@@ -85,7 +86,13 @@ def _build_database_url() -> str:
             "or LOGGER_DB_PASSWORD plus the component env vars."
         )
 
-    return f"postgresql://{user}:{password}@{host}:{port}/{name}"
+    # URL-encode the credentials so characters that are reserved in a URL
+    # (e.g. '@', ':', '/', '?', '#') in a password or username do not corrupt
+    # the connection URL. safe='' encodes everything, including '/'.
+    user_enc = quote(user, safe="")
+    password_enc = quote(password, safe="")
+
+    return f"postgresql://{user_enc}:{password_enc}@{host}:{port}/{name}"
 
 
 DATABASE_URL: str = _build_database_url()

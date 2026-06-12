@@ -273,6 +273,17 @@ async def create_event(
 
     model_cls, retention_class = dispatch_entry
 
+    # Idempotency: a retried POST (same request_id + same content) must not
+    # create a second row. The event_id is generated server-side, so the only
+    # natural key is the inbound envelope. The HMAC signature is deterministic
+    # over the full canonical content, and the target table already fixes the
+    # event_type, so (request_id, hmac_signature) on this table uniquely
+    # identifies a logical event. A DB UNIQUE constraint cannot serve here:
+    # the tables are RANGE-partitioned on created_at, so any unique constraint
+    # would have to include created_at, which is freshly stamped per attempt
+    # and therefore differs between a request and its retry. We do an
+    # application-level existence check instead (the app role has SELECT).
+
     # Re-derive the payload dict so we can recompute the HMAC. We use
     # model_dump(mode='json') so datetime/UUID serialise the same way
     # they did on the emitter side. The emitter must call the same
@@ -290,6 +301,9 @@ async def create_event(
         signature=event.hmac_signature,
     )
     if not ok:
+        # Keep the specific reason (clock-skew seconds, bad signature, etc.)
+        # in the server log only; return a generic detail to the client so we
+        # don't leak verification internals to a potential attacker.
         logger.warning(
             f"Event rejected "
             f"(request_id={event.request_id}, type={event.event_type.value}): "
@@ -297,7 +311,46 @@ async def create_event(
         )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=error,
+            detail="Invalid or missing signature",
+        )
+
+    # Idempotent short-circuit: if an identical event (same request_id and
+    # hmac_signature) already exists in this table, return its event_id with
+    # success rather than inserting a duplicate on retry.
+    try:
+        existing_id = (
+            db.query(model_cls.event_id)
+            .filter(
+                model_cls.request_id == event.request_id,
+                model_cls.hmac_signature == event.hmac_signature,
+            )
+            .limit(1)
+            .scalar()
+        )
+    except Exception as exc:
+        db.rollback()
+        logger.error(
+            f"Idempotency lookup failed "
+            f"(request_id={event.request_id}, type={event.event_type.value}): "
+            f"{exc}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to persist event",
+        )
+
+    if existing_id is not None:
+        logger.info(
+            f"Duplicate event ignored "
+            f"(event_id={existing_id}, request_id={event.request_id}, "
+            f"type={event.event_type.value})"
+        )
+        return EventResponse(
+            success=True,
+            event_id=existing_id,
+            event_type=event.event_type,
+            message="Event already captured",
         )
 
     # Common envelope columns for every event type.
@@ -354,8 +407,13 @@ async def create_event(
 
     try:
         db.add(row)
+        # flush() applies the client-side uuid4 default and emits the INSERT,
+        # so we can read event_id here without the db.refresh() round-trip the
+        # previous code did after commit (commit expires attributes by default,
+        # which would otherwise trigger a reload on the next access).
+        db.flush()
+        event_id = row.event_id
         db.commit()
-        db.refresh(row)
     except Exception as exc:
         db.rollback()
         logger.error(
@@ -371,7 +429,7 @@ async def create_event(
 
     logger.info(
         f"Event captured "
-        f"(event_id={row.event_id}, "
+        f"(event_id={event_id}, "
         f"request_id={event.request_id}, "
         f"type={event.event_type.value}, "
         f"session={event.session_id or 'null'})"
@@ -379,7 +437,7 @@ async def create_event(
 
     return EventResponse(
         success=True,
-        event_id=row.event_id,
+        event_id=event_id,
         event_type=event.event_type,
         message="Event captured",
     )

@@ -1,100 +1,67 @@
-<#
-.SYNOPSIS
-    Idempotently create the openagent-network Docker network.
+#!/usr/bin/env bash
+#
+# Idempotently create the openagent-network Docker network.
+#
+# Ensures the openagent-network Docker network exists on this host. Run this
+# once per machine BEFORE 'docker compose up' so the compose file's
+# external-network reference can resolve.
+#
+# Safe to run any number of times. If the network already exists the script
+# reports "already exists" and exits 0. If anything else goes wrong (Docker not
+# installed, daemon not reachable, network-create fails) it exits 1 with a
+# clear message.
+#
+# This is the bash counterpart of scripts/setup-network.ps1.
+#
+# openagent-logger owns the shared Docker network and the shared Postgres
+# instance the other OpenAgent services attach to; this script creates that
+# network. See README.
+#
+# Usage:
+#     ./scripts/setup-network.sh
 
-.DESCRIPTION
-    Ensures the openagent-network Docker network exists on this host. Run
-    this once per machine BEFORE 'docker compose up' so the compose
-    file's external-network reference can resolve.
+set -euo pipefail
 
-    Safe to run any number of times. If the network already exists the
-    script reports "already exists" and exits with code 0. If anything
-    else goes wrong (Docker not installed, daemon not reachable,
-    network-create fails) it exits with code 1 and a clear message.
-
-.NOTES
-    openagent-logger owns the shared Docker network and the shared
-    Postgres instance the other OpenAgent services attach to; this
-    script creates that network. See README.
-
-    Execution-policy note:
-        PowerShell may refuse to run this script the first time with an
-        "execution policy" error. Either bypass for one invocation:
-
-            powershell -ExecutionPolicy Bypass -File .\scripts\setup-network.ps1
-
-        or relax the policy once for your user account:
-
-            Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-
-.EXAMPLE
-    .\scripts\setup-network.ps1
-#>
-
-$ErrorActionPreference = 'Stop'
-$NETWORK_NAME = 'openagent-network'
-
+NETWORK_NAME='openagent-network'
 
 # ---------------------------------------------------------------------
 # 1. Verify the docker command is on PATH
 # ---------------------------------------------------------------------
 
-try {
-    $null = Get-Command docker -ErrorAction Stop
-} catch {
-    Write-Host "ERROR: 'docker' command not found." -ForegroundColor Red
-    Write-Host "  Install Docker Desktop and ensure it is on PATH." -ForegroundColor Red
+if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: 'docker' command not found." >&2
+    echo "  Install Docker and ensure it is on PATH." >&2
     exit 1
-}
-
+fi
 
 # ---------------------------------------------------------------------
 # 2. Verify the Docker daemon is reachable
 # ---------------------------------------------------------------------
-#
-# External commands in PowerShell do NOT throw exceptions on non-zero
-# exit. We check $LASTEXITCODE explicitly.
 
-docker info 2>$null | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: Docker daemon is not reachable." -ForegroundColor Red
-    Write-Host "  Start Docker Desktop, then re-run this script." -ForegroundColor Red
+if ! docker info >/dev/null 2>&1; then
+    echo "ERROR: Docker daemon is not reachable." >&2
+    echo "  Start Docker, then re-run this script." >&2
     exit 1
-}
-
+fi
 
 # ---------------------------------------------------------------------
-# 3. Check whether the network already exists
+# 3. Create the network idempotently
 # ---------------------------------------------------------------------
 #
-# Listing all networks and comparing names locally avoids the regex
-# quoting issues that come with the --filter 'name=^...$' approach
-# across different PowerShell versions.
+# 'docker network inspect' succeeds (exit 0) only if the network exists, so it
+# is a clean existence test that avoids name-matching pitfalls.
 
-$networks = @(docker network ls --format '{{.Name}}')
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: 'docker network ls' failed." -ForegroundColor Red
-    exit 1
-}
-
-if ($networks -contains $NETWORK_NAME) {
-    Write-Host "OK: Docker network '$NETWORK_NAME' already exists." -ForegroundColor Green
+if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+    echo "OK: Docker network '$NETWORK_NAME' already exists."
     exit 0
-}
+fi
 
-
-# ---------------------------------------------------------------------
-# 4. Create the network
-# ---------------------------------------------------------------------
-
-Write-Host "Creating Docker network '$NETWORK_NAME'..." -ForegroundColor Cyan
-docker network create $NETWORK_NAME | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: 'docker network create $NETWORK_NAME' failed." -ForegroundColor Red
+echo "Creating Docker network '$NETWORK_NAME'..."
+if ! docker network create "$NETWORK_NAME" >/dev/null; then
+    echo "ERROR: 'docker network create $NETWORK_NAME' failed." >&2
     exit 1
-}
+fi
 
-Write-Host "OK: Docker network '$NETWORK_NAME' created." -ForegroundColor Green
-Write-Host ""
-Write-Host "Next: 'docker compose up' will now be able to attach to this network." -ForegroundColor Gray
+echo "OK: Docker network '$NETWORK_NAME' created."
+echo "Next: 'docker compose up' will now be able to attach to this network."
 exit 0

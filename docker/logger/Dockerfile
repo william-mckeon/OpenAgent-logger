@@ -149,4 +149,10 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
 # `exec uvicorn` makes uvicorn replace sh as PID 1 so that SIGTERM from
 # Docker / Render reaches uvicorn directly and the FastAPI lifespan handler's
 # shutdown_scheduler() actually runs.
-CMD ["sh", "-c", "exec uvicorn src.api:app --host 0.0.0.0 --port ${LOGGER_PORT}"]
+#
+# --workers 1 is REQUIRED, not incidental: the retention scheduler runs
+# in-process (src/scheduler.py). With >1 worker each process would start its
+# own scheduler and run retention concurrently. Pinning a single worker keeps
+# exactly one scheduler. (A DB advisory lock guards the job as a backstop, but
+# one worker is the intended topology - scale out with a dedicated instance.)
+CMD ["sh", "-c", "exec uvicorn src.api:app --host 0.0.0.0 --port ${LOGGER_PORT} --workers 1"]

@@ -217,6 +217,13 @@ def drop_partitions_older_than(
             drop_sql = text("SELECT openagent_logger.drop_partition(:partition)")
             try:
                 with engine.begin() as conn:
+                    # Bound how long the DROP will wait on a lock. A partition
+                    # blocked by a long-running reader must not hang the daily
+                    # retention job; if we can't acquire the lock in time we
+                    # fail this one partition (logged below) and move on - the
+                    # next daily run retries it. SET LOCAL is scoped to this
+                    # transaction (engine.begin()).
+                    conn.execute(text("SET LOCAL lock_timeout = '5s'"))
                     conn.execute(drop_sql, {"partition": partition_name})
                 logger.info(
                     f"Dropped partition {schema}.{partition_name} "

@@ -22,12 +22,37 @@ retention_class is NOT part of the inbound contract - it is derived
 server-side from event_type and stored on the row.
 """
 
+import json
+import re
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Dict, Literal, Optional, Union
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+# Maximum serialized size of a `details` JSONB payload. JSONB columns are
+# otherwise unbounded; this caps a single event so a pathological emitter
+# cannot push multi-megabyte blobs into the capture tables.
+MAX_DETAILS_JSON_BYTES: int = 16 * 1024  # 16 KB
+
+
+def _validate_details_size(value: Dict[str, Any]) -> Dict[str, Any]:
+    """Reject a details dict whose serialized JSON exceeds MAX_DETAILS_JSON_BYTES.
+
+    Shared by the ops_event and audit_event payload validators. Measured in
+    UTF-8 bytes against a compact JSON encoding so the limit matches the
+    on-the-wire / stored size rather than character count.
+    """
+    encoded = json.dumps(value, separators=(",", ":"), default=str)
+    size = len(encoded.encode("utf-8"))
+    if size > MAX_DETAILS_JSON_BYTES:
+        raise ValueError(
+            f"details exceeds maximum size "
+            f"({size} > {MAX_DETAILS_JSON_BYTES} bytes)"
+        )
+    return value
 
 
 # ---------------------------------------------------------------------
@@ -127,11 +152,14 @@ class EventEnvelope(BaseModel):
     @field_validator("hmac_signature")
     @classmethod
     def _signature_is_hex(cls, v: str) -> str:
-        """Ensure hmac_signature is a valid lowercase hex string."""
-        try:
-            int(v, 16)
-        except ValueError as exc:
-            raise ValueError("hmac_signature must be a hexadecimal string") from exc
+        """Ensure hmac_signature is exactly 64 lowercase-hex characters.
+
+        We use a strict regex rather than int(v, 16): int() accepts a leading
+        sign and surrounding whitespace ('+...', '-...', ' ff '), which are not
+        valid HMAC hex digests and would corrupt the canonical comparison.
+        """
+        if not re.fullmatch(r"[0-9a-f]{64}", v.lower()):
+            raise ValueError("hmac_signature must be a 64-character hexadecimal string")
         return v.lower()
 
 
@@ -167,6 +195,12 @@ class OpsEventPayload(BaseModel):
         default_factory=dict,
         description="Free-form context. Persisted as JSONB. Keep payloads small.",
     )
+
+    @field_validator("details")
+    @classmethod
+    def _details_within_cap(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        """Reject a details payload whose serialized JSON exceeds the cap."""
+        return _validate_details_size(v)
 
 
 class ConversationCapturePayload(BaseModel):
@@ -243,11 +277,13 @@ class ConversationCapturePayload(BaseModel):
     @field_validator("input_hash", "output_hash")
     @classmethod
     def _hash_is_hex(cls, v: str) -> str:
-        """Ensure content hashes are valid lowercase hex strings."""
-        try:
-            int(v, 16)
-        except ValueError as exc:
-            raise ValueError("hash field must be a hexadecimal string") from exc
+        """Ensure content hashes are exactly 64 lowercase-hex characters.
+
+        Strict regex rather than int(v, 16), which would accept a leading sign
+        or surrounding whitespace that are not valid SHA-256 hex digests.
+        """
+        if not re.fullmatch(r"[0-9a-f]{64}", v.lower()):
+            raise ValueError("hash field must be a 64-character hexadecimal string")
         return v.lower()
 
 
@@ -302,6 +338,12 @@ class AuditEventPayload(BaseModel):
         default_factory=dict,
         description="Additional structured context. Persisted as JSONB.",
     )
+
+    @field_validator("details")
+    @classmethod
+    def _details_within_cap(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        """Reject a details payload whose serialized JSON exceeds the cap."""
+        return _validate_details_size(v)
 
 
 # ---------------------------------------------------------------------

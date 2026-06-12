@@ -34,6 +34,7 @@ from typing import Dict, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from .partitioning import (
@@ -66,6 +67,12 @@ RETENTION_DAYS: Dict[str, int] = {
 SCHEDULE_HOUR: int = int(
     os.environ.get("LOGGER_RETENTION_SCHEDULE_HOUR", "3")
 )
+
+# Fixed bigint key for the session-level Postgres advisory lock that guards the
+# retention run. Multiple instances / workers all hash to this same key, so only
+# one acquires the lock and runs the job; the others skip. The value is an
+# arbitrary constant unique to this job within the openagent_logger database.
+RETENTION_ADVISORY_LOCK_KEY: int = 7264012025010301
 
 
 # ---------------------------------------------------------------------
@@ -164,18 +171,55 @@ class RetentionScheduler:
             logger.error(f"Daily retention job failed: {exc}", exc_info=True)
 
     def _run_blocking(self) -> None:
-        """Synchronous body of the daily job. Runs in the executor."""
-        self._ensure_partitions()
-        self._drop_expired_partitions()
+        """Synchronous body of the daily job. Runs in the executor.
+
+        Guards the whole run with a session-level Postgres advisory lock so
+        that multiple service instances / workers don't run retention
+        concurrently (double DROPs, redundant catalog churn). If another
+        instance holds the lock we skip this run entirely and log; the lock is
+        always released in finally on the same connection that took it.
+        """
+        with self.engine.connect() as conn:
+            acquired = conn.execute(
+                text("SELECT pg_try_advisory_lock(:key)"),
+                {"key": RETENTION_ADVISORY_LOCK_KEY},
+            ).scalar()
+
+            if not acquired:
+                logger.info(
+                    "Retention job skipped: advisory lock held by another "
+                    "instance (this is expected when multiple instances run)"
+                )
+                return
+
+            try:
+                self._ensure_partitions()
+                self._drop_expired_partitions()
+            finally:
+                conn.execute(
+                    text("SELECT pg_advisory_unlock(:key)"),
+                    {"key": RETENTION_ADVISORY_LOCK_KEY},
+                )
 
     def _ensure_partitions(self) -> None:
-        """Ensure current and next month partitions exist for every managed table."""
+        """Ensure current and next month partitions exist for every managed table.
+
+        create_partition_for_month returns False (logged inside) when creation
+        fails. We surface that here with an error log rather than ignoring the
+        bool, so a silent failure to create next month's partition - which
+        would make writes start failing at the calendar boundary - is visible
+        in operator logs instead of going unnoticed.
+        """
         cur_year, cur_month = current_month()
         nxt_year, nxt_month = next_month(cur_year, cur_month)
 
         for table in MANAGED_TABLES:
-            create_partition_for_month(self.engine, table, cur_year, cur_month)
-            create_partition_for_month(self.engine, table, nxt_year, nxt_month)
+            for yr, mo in ((cur_year, cur_month), (nxt_year, nxt_month)):
+                if not create_partition_for_month(self.engine, table, yr, mo):
+                    logger.error(
+                        f"Partition ensure FAILED for {table} {yr:04d}-{mo:02d}; "
+                        f"writes to that month may fail until this succeeds"
+                    )
 
     def _drop_expired_partitions(self) -> None:
         """Drop partitions older than each table's retention window."""
