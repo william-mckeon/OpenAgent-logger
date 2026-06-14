@@ -36,6 +36,13 @@ MANAGED_TABLES: List[str] = [
     "audit_events",
 ]
 
+# The schema is fixed, not a per-call argument: the SECURITY DEFINER functions
+# this module calls (create_month_partition / drop_partition) live in, and are
+# pinned to, the openagent_logger schema in database/init.sql. A previous
+# `schema=` parameter was misleading — it was honoured only in log strings (and
+# the listing filter) while the actual DDL always ran in openagent_logger.
+SCHEMA: str = "openagent_logger"
+
 
 # ---------------------------------------------------------------------
 # Naming convention
@@ -85,7 +92,6 @@ def create_partition_for_month(
     table_name: str,
     year: int,
     month: int,
-    schema: str = "openagent_logger",
 ) -> bool:
     """
     Ensure a partition exists for one parent table, for one calendar month.
@@ -98,7 +104,6 @@ def create_partition_for_month(
         table_name: Parent table name. Must be in MANAGED_TABLES.
         year: Four-digit year.
         month: 1-12.
-        schema: Schema containing the parent table.
 
     Returns:
         bool: True if the SQL ran without error, False otherwise.
@@ -128,13 +133,13 @@ def create_partition_for_month(
                 {"parent": table_name, "start_d": start_d, "end_d": end_d},
             )
         logger.info(
-            f"Partition ensured: {schema}.{partition_name} "
+            f"Partition ensured: {SCHEMA}.{partition_name} "
             f"[{start_d.isoformat()} -> {end_d.isoformat()})"
         )
         return True
     except Exception as exc:
         logger.error(
-            f"Failed to create partition {schema}.{partition_name}: {exc}"
+            f"Failed to create partition {SCHEMA}.{partition_name}: {exc}"
         )
         return False
 
@@ -147,7 +152,6 @@ def drop_partitions_older_than(
     engine: Engine,
     table_name: str,
     cutoff: date,
-    schema: str = "openagent_logger",
 ) -> int:
     """
     Drop all partitions of a parent table whose end date is on or before cutoff.
@@ -162,7 +166,6 @@ def drop_partitions_older_than(
         engine: SQLAlchemy engine bound to the logger DB.
         table_name: Parent table name. Must be in MANAGED_TABLES.
         cutoff: Drop partitions whose end date is on or before this.
-        schema: Schema containing the parent table.
 
     Returns:
         int: Number of partitions actually dropped.
@@ -190,11 +193,11 @@ def drop_partitions_older_than(
         with engine.connect() as conn:
             rows = conn.execute(
                 list_partitions_sql,
-                {"schema": schema, "parent": table_name},
+                {"schema": SCHEMA, "parent": table_name},
             ).fetchall()
     except Exception as exc:
         logger.error(
-            f"Failed to list partitions for {schema}.{table_name}: {exc}"
+            f"Failed to list partitions for {SCHEMA}.{table_name}: {exc}"
         )
         return 0
 
@@ -206,7 +209,7 @@ def drop_partitions_older_than(
         if end_date is None:
             logger.warning(
                 f"Could not parse bound expression for "
-                f"{schema}.{partition_name}: {bound_expr!r} - skipping"
+                f"{SCHEMA}.{partition_name}: {bound_expr!r} - skipping"
             )
             continue
 
@@ -226,13 +229,13 @@ def drop_partitions_older_than(
                     conn.execute(text("SET LOCAL lock_timeout = '5s'"))
                     conn.execute(drop_sql, {"partition": partition_name})
                 logger.info(
-                    f"Dropped partition {schema}.{partition_name} "
+                    f"Dropped partition {SCHEMA}.{partition_name} "
                     f"(ended {end_date.isoformat()}, cutoff {cutoff.isoformat()})"
                 )
                 dropped_count += 1
             except Exception as exc:
                 logger.error(
-                    f"Failed to drop partition {schema}.{partition_name}: {exc}"
+                    f"Failed to drop partition {SCHEMA}.{partition_name}: {exc}"
                 )
 
     return dropped_count

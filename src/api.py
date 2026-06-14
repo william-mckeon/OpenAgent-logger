@@ -58,6 +58,7 @@ from .scheduler import (
 from .security import (
     configuration_status,
     require_logger_api_key,
+    require_logger_api_key_for_health,
     verify_event,
     warn_if_missing_secrets,
 )
@@ -314,6 +315,34 @@ async def create_event(
             detail="Invalid or missing signature",
         )
 
+    # Serialize concurrent retries of the *same* logical event so the
+    # check-then-insert below cannot race. Without this, two identical POSTs can
+    # both pass the existence check (neither has committed yet) and both INSERT,
+    # producing duplicate rows. A DB UNIQUE constraint cannot prevent this — the
+    # tables are RANGE-partitioned on created_at, which is freshly stamped per
+    # attempt and would have to be part of any unique key — so we serialize with
+    # a transaction-scoped advisory lock keyed on (request_id, hmac_signature).
+    # It is released automatically when this transaction commits or rolls back.
+    # Distinct events hash to distinct keys, so contention is limited to genuine
+    # retries of the same event.
+    try:
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:rid), hashtext(:sig))"),
+            {"rid": str(event.request_id), "sig": event.hmac_signature},
+        )
+    except Exception as exc:
+        db.rollback()
+        logger.error(
+            f"Idempotency lock failed "
+            f"(request_id={event.request_id}, type={event.event_type.value}): "
+            f"{exc}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to persist event",
+        )
+
     # Idempotent short-circuit: if an identical event (same request_id and
     # hmac_signature) already exists in this table, return its event_id with
     # success rather than inserting a duplicate on retry.
@@ -453,9 +482,11 @@ async def create_event(
     summary="Service readiness",
     description=(
         "Reports database connectivity and scheduler status. Authenticated "
-        "because operational state at this boundary is internal information."
+        "when a key is configured (operational state at this boundary is "
+        "internal information); reachable without a key when LOGGER_API_KEY is "
+        "unset, so a misconfigured server can still be observed."
     ),
-    dependencies=[Depends(require_logger_api_key)],
+    dependencies=[Depends(require_logger_api_key_for_health)],
 )
 async def health() -> HealthResponse:
     """
@@ -517,23 +548,31 @@ async def stats(db: Session = Depends(get_db)) -> StatsResponse:
         StatsResponse with counts and oldest/newest timestamps.
     """
     try:
-        ops_count = db.query(func.count(OpsEvent.event_id)).scalar() or 0
-        cap_count = db.query(func.count(ConversationCapture.event_id)).scalar() or 0
-        audit_count = db.query(func.count(AuditEvent.event_id)).scalar() or 0
+        # One aggregate query per table (count + min + max in a single scan)
+        # instead of nine separate round-trips. /stats is already expensive on
+        # partitioned tables; this keeps it to three queries.
+        def _table_stats(model_cls: Any) -> Any:
+            return db.query(
+                func.count(model_cls.event_id),
+                func.min(model_cls.created_at),
+                func.max(model_cls.created_at),
+            ).one()
+
+        ops_count, ops_min, ops_max = _table_stats(OpsEvent)
+        cap_count, cap_min, cap_max = _table_stats(ConversationCapture)
+        audit_count, audit_min, audit_max = _table_stats(AuditEvent)
+
+        ops_count = ops_count or 0
+        cap_count = cap_count or 0
+        audit_count = audit_count or 0
 
         # Overall oldest and newest timestamps across all three tables.
-        timestamps_min = [
-            db.query(func.min(OpsEvent.created_at)).scalar(),
-            db.query(func.min(ConversationCapture.created_at)).scalar(),
-            db.query(func.min(AuditEvent.created_at)).scalar(),
-        ]
-        timestamps_max = [
-            db.query(func.max(OpsEvent.created_at)).scalar(),
-            db.query(func.max(ConversationCapture.created_at)).scalar(),
-            db.query(func.max(AuditEvent.created_at)).scalar(),
-        ]
-        oldest = min((t for t in timestamps_min if t is not None), default=None)
-        newest = max((t for t in timestamps_max if t is not None), default=None)
+        oldest = min(
+            (t for t in (ops_min, cap_min, audit_min) if t is not None), default=None
+        )
+        newest = max(
+            (t for t in (ops_max, cap_max, audit_max) if t is not None), default=None
+        )
 
     except Exception as exc:
         logger.error(f"Stats query failed: {exc}", exc_info=True)

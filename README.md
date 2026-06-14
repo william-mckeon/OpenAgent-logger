@@ -92,10 +92,16 @@ import httpx
 request_id = str(uuid.uuid4())
 ts = datetime.now(timezone.utc).isoformat()
 payload = {"action": "request_received", "outcome": "success", "details": {}}
+source_service = "test-client"
+session_id = None   # serialises as "" in the canonical string
+user_id = None      # serialises as "" in the canonical string
 
 canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 payload_hash = hashlib.sha256(canonical_payload.encode()).hexdigest()
-canonical_string = f"{request_id}|{ts}|ops_event|{payload_hash}"
+canonical_string = (
+    f"{request_id}|{ts}|ops_event|{source_service}"
+    f"|{session_id or ''}|{user_id or ''}|{payload_hash}"
+)
 sig = hmac.new(
     os.environ["LOGGER_HMAC_SECRET"].encode(),
     canonical_string.encode(),
@@ -105,10 +111,10 @@ sig = hmac.new(
 body = {
     "event_type": "ops_event",
     "request_id": request_id,
-    "source_service": "test-client",
+    "source_service": source_service,
     "client_timestamp": ts,
-    "session_id": None,   # optional, nullable, caller-supplied; not validated
-    "user_id": None,      # optional, nullable, caller-supplied; not validated
+    "session_id": session_id,   # optional, nullable, caller-supplied; not validated
+    "user_id": user_id,         # optional, nullable, caller-supplied; not validated
     "hmac_signature": sig,
     "payload": payload,
 }
@@ -133,11 +139,11 @@ A brief summary:
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
 | `POST` | `/events` | `X-API-Key` + HMAC | Capture a signed event |
-| `GET` | `/health` | `X-API-Key` | Service readiness probe |
+| `GET` | `/health` | `X-API-Key` (only if `LOGGER_API_KEY` is set) | Service readiness probe |
 | `GET` | `/stats` | `X-API-Key` | Row counts and timestamp bounds |
 | `GET` | `/` | (none) | Service identification only |
 
-`/health` and `/stats` are intentionally authenticated — operational state at this boundary is internal information and not appropriate for an unauthenticated probe.
+`/health` and `/stats` are intentionally authenticated — operational state at this boundary is internal information and not appropriate for an unauthenticated probe. The one deliberate exception: when `LOGGER_API_KEY` is **unset**, `/health` answers without a key so a misconfigured server stays observable rather than being hidden behind an error. Once a key is configured, `/health` enforces it normally (`401` on a missing or wrong key).
 
 ---
 
@@ -162,10 +168,10 @@ This protects against **any** unauthorised caller reaching the service. It is th
 Every event body must carry an `hmac_signature` field. The signature is HMAC-SHA256 over the canonical string:
 
 ```text
-{request_id}|{client_timestamp_iso}|{event_type}|{sha256(canonical_payload_json)}
+{request_id}|{client_timestamp_iso}|{event_type}|{source_service}|{session_id}|{user_id}|{payload_hash}
 ```
 
-where `canonical_payload_json` is the event's `payload` dict serialised with `json.dumps(sort_keys=True, separators=(",", ":"), default=str)`.
+where `payload_hash` is `sha256(canonical_payload_json)`, `canonical_payload_json` is the event's `payload` dict serialised with `json.dumps(sort_keys=True, separators=(",", ":"), default=str)`, and the signed attribution fields `source_service`, `session_id`, `user_id` each serialise as the empty string when NULL. Signing these fields means they cannot be rewritten in transit.
 
 The receiver re-derives the canonical string from the parsed body and compares (constant-time) against `hmac_signature`. Mismatch → HTTP 401.
 
@@ -185,7 +191,7 @@ The emitter and receiver **must** compute the same canonical string for the same
 
 1. The payload dict is serialised with `json.dumps(sort_keys=True, separators=(",", ":"), default=str, ensure_ascii=False)`.
 2. The resulting bytes are SHA-256 hashed.
-3. The canonical string is built from `{request_id}|{iso_timestamp}|{event_type}|{payload_hash}`.
+3. The canonical string is built from `{request_id}|{iso_timestamp}|{event_type}|{source_service}|{session_id}|{user_id}|{payload_hash}`, where a NULL `source_service`/`session_id`/`user_id` is rendered as the empty string.
 4. HMAC-SHA256 over the canonical string, using `LOGGER_HMAC_SECRET.encode("utf-8")` as the key.
 
 Both `src/security.py` (here) and `src/client/logger.py` in `openagent-api` implement this. They must stay in lockstep.
@@ -242,10 +248,12 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `LOGGER_RETENTION_OPS_DAYS` | `90` | Drop ops_events partitions older than this |
-| `LOGGER_RETENTION_CONVERSATION_DAYS` | `180` | Same for conversation_captures |
-| `LOGGER_RETENTION_AUDIT_DAYS` | `2555` | Same for audit_events (~7 years) |
+| `LOGGER_RETENTION_OPS_DAYS` | `90` | Drop ops_events partitions older than this (hard minimum: 90 days) |
+| `LOGGER_RETENTION_CONVERSATION_DAYS` | `180` | Same for conversation_captures (hard minimum: 180 days) |
+| `LOGGER_RETENTION_AUDIT_DAYS` | `2555` | Same for audit_events, ~7 years (hard minimum: 2555 days) |
 | `LOGGER_RETENTION_SCHEDULE_HOUR` | `3` | UTC hour of day for the daily job |
+
+The minimum-age values above are **hard floors enforced in SQL**, not just defaults. The `drop_partition` SECURITY DEFINER function in `database/init.sql` hardcodes them (2555 days audit / 180 conversation / 90 ops) and **refuses** to drop a partition whose range ends within that floor. Setting a `LOGGER_RETENTION_*_DAYS` value *below* the corresponding floor does not shorten retention: the scheduler will ask for the drop, and the SQL backstop will reject it. This is what keeps the append-only guarantee intact even if the app role is told to drop too aggressively.
 
 ---
 

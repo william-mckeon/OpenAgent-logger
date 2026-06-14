@@ -132,10 +132,13 @@ Capture a signed event.
 **Canonical string (for `hmac_signature`)**
 
 ```text
-{request_id}|{client_timestamp_iso}|{event_type}|{sha256(canonical_payload_json)}
+{request_id}|{client_timestamp_iso}|{event_type}|{source_service}|{session_id}|{user_id}|{payload_hash}
 ```
 
-where `canonical_payload_json` is:
+where `payload_hash` is `sha256(canonical_payload_json)` and the attribution
+fields (`source_service`, `session_id`, `user_id`) are signed so they cannot be
+rewritten in transit. A NULL `source_service`, `session_id`, or `user_id`
+serializes as the empty string. `canonical_payload_json` is:
 
 ```python
 json.dumps(payload, sort_keys=True, separators=(",", ":"),
@@ -176,7 +179,12 @@ Report service readiness.
 
 | Header | Value | Required |
 |---|---|---|
-| `X-API-Key` | `<LOGGER_API_KEY>` | yes |
+| `X-API-Key` | `<LOGGER_API_KEY>` | conditional |
+
+`/health` requires the key only when `LOGGER_API_KEY` is configured (then a
+missing/wrong key is `401`). When `LOGGER_API_KEY` is unset, `/health` answers
+without a key, so a misconfigured server is still observable rather than locked
+behind a 500.
 
 **Success — `200 OK`**
 
@@ -291,12 +299,22 @@ are always aligned by construction.
   `LOGGER_DB_PORT`, `LOGGER_DB_NAME`.
 - Pooling: SQLAlchemy default (`pool_size=5`, `max_overflow=10`,
   `pool_pre_ping=True`, `pool_recycle=300`).
-- The `openagent_logger` DB role:
-  - Owns the `openagent_logger` schema and all tables within it.
-  - Has `SELECT` and `INSERT` granted (no `UPDATE`, no `DELETE`).
-  - Has `DROP TABLE` on partitions via ownership, used at retention time.
-  - Has its password provisioned at init time from the `logger.db_password`
-    GUC (see Role provisioning above) — not via a separate operator step.
+- Ownership is split across two roles to make the append-only guarantee hold:
+  - `openagent_logger_admin` (NOLOGIN) owns the schema, every table/partition,
+    and the partition-management functions. Nothing ever connects as this role;
+    its privileges are reachable only through the `SECURITY DEFINER` functions.
+  - `openagent_logger` is the application LOGIN role. It **owns nothing** and is
+    granted only `SELECT`, `INSERT`, and `EXECUTE` on the two partition
+    functions (no `UPDATE`, no `DELETE`, no `CREATE` on the schema). Because it
+    is not an owner, it **cannot `DROP`, `TRUNCATE`, or `ALTER`** any table.
+- This owner/login split is exactly what enforces the append-only guarantee
+  against a compromised app token: such a token cannot bulk-remove or rewrite
+  audit data. Retention `DROP`s do not go through app-role ownership — they run
+  via the `SECURITY DEFINER` `drop_partition` function (owned by the admin
+  role), which validates its input and enforces minimum-age floors.
+- The `openagent_logger` role's password is provisioned at init time from the
+  `logger.db_password` GUC (see Role provisioning above) — not via a separate
+  operator step.
 
 **Schema scoping**
 
@@ -444,7 +462,7 @@ can independently re-verify integrity without trusting the storage layer:
 
 1. Re-compute `canonical_payload_json` from the stored `payload` using the
    exact `json.dumps` kwargs in §2.1.
-2. Re-build the canonical string `{request_id}|{client_timestamp}|{event_type}|{payload_hash}`.
+2. Re-build the canonical string `{request_id}|{client_timestamp}|{event_type}|{source_service}|{session_id}|{user_id}|{payload_hash}` (NULL `source_service`/`session_id`/`user_id` render as the empty string).
 3. Re-compute HMAC-SHA256 keyed with `LOGGER_HMAC_SECRET` and compare
    (constant-time) against the stored `hmac_signature` column.
 

@@ -143,7 +143,10 @@ class EventEnvelope(BaseModel):
         max_length=64,
         description=(
             "HMAC-SHA256 over the canonical string "
-            "'{request_id}|{client_timestamp}|{event_type}|{sha256(payload)}'. "
+            "'{request_id}|{client_timestamp}|{event_type}|{source_service}"
+            "|{session_id}|{user_id}|{payload_hash}', where payload_hash = "
+            "sha256(canonical_payload_json) and a NULL source_service, "
+            "session_id, or user_id serializes as the empty string. "
             "Verified at ingestion and stored alongside the event so "
             "downstream consumers can re-verify integrity later."
         ),

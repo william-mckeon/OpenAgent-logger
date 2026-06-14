@@ -21,8 +21,12 @@ These are two INDEPENDENT secrets. Compromise of one does not grant forge
 ability on the other. See README's Security Model section for the full
 threat-model walk-through.
 
-The canonical string format is:
-    {request_id}|{client_timestamp_iso}|{event_type}|{sha256(canonical_payload_json)}
+The canonical string format is seven pipe-separated fields:
+    {request_id}|{client_timestamp}|{event_type}|{source_service}|{session_id}|{user_id}|{payload_hash}
+where payload_hash = sha256(canonical_payload_json) and the attribution fields
+(source_service, session_id, user_id) serialize as the empty string "" when
+None. This must match the emitter (openagent-api/src/client/logger.py) byte for
+byte — see _canonical_string below.
 
 We hash the payload rather than including it directly so the signature
 stays valid even if the stored payload is later transformed (compressed,
@@ -137,6 +141,43 @@ async def require_logger_api_key(
     return None
 
 
+async def require_logger_api_key_for_health(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> None:
+    """
+    Auth for /health that still answers when the server is misconfigured.
+
+    /health exists so an operator can observe the service — including when it is
+    misconfigured. The lifespan deliberately boots even if LOGGER_API_KEY is
+    unset so that state can be surfaced; but the standard dependency raises 500
+    in exactly that case, which would make /health unable to report it. This
+    variant instead lets the probe through when LOGGER_API_KEY is unset (so the
+    unhealthy/misconfigured state is observable), and authenticates normally
+    (401 on missing/wrong key) once a key IS configured.
+
+    Args:
+        x_api_key: The X-API-Key header value (auto-extracted by FastAPI).
+
+    Raises:
+        HTTPException(401): Only when a key IS configured and the header is
+            missing or does not match.
+    """
+    if not LOGGER_API_KEY:
+        logger.warning(
+            "Health probe served without auth: LOGGER_API_KEY is not configured."
+        )
+        return None
+
+    if not x_api_key or not hmac.compare_digest(x_api_key, LOGGER_API_KEY):
+        logger.warning("Health probe rejected: X-API-Key missing or mismatch")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key",
+        )
+
+    return None
+
+
 # ---------------------------------------------------------------------
 # Canonical payload serialization
 # ---------------------------------------------------------------------
@@ -236,7 +277,7 @@ def compute_signature(
             request_id,
             client_timestamp,
             event_type,
-            source_service,
+            _fmt_envelope_field(source_service),
             _fmt_envelope_field(session_id),
             _fmt_envelope_field(user_id),
             payload_hash,
